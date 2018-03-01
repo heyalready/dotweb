@@ -80,6 +80,8 @@ type (
 
 	RouterNode interface {
 		Use(m ...Middleware) *Node
+		AppMiddlewares() []Middleware
+		GroupMiddlewares() []Middleware
 		Middlewares() []Middleware
 		Node() *Node
 	}
@@ -93,8 +95,8 @@ type (
 	// router is a http.Handler which can be used to dispatch requests to different
 	// handler functions via configurable routes
 	router struct {
-		Nodes map[string]*Node
-
+		Nodes        map[string]*Node
+		allRouterExpress   map[string]struct{}
 		server       *HttpServer
 		handlerMap   map[string]HttpHandle
 		handlerMutex *sync.RWMutex
@@ -117,24 +119,9 @@ type (
 		// RedirectTrailingSlash is independent of this option.
 		RedirectFixedPath bool
 
-		// If enabled, the router checks if another method is allowed for the
-		// current route, if the current request can not be routed.
-		// If this is the case, the request is answered with 'Method Not Allowed'
-		// and HTTP status code 405.
-		// If no other Method is allowed, the request is delegated to the NotFound
-		// handler.
-		HandleMethodNotAllowed bool
-
 		// If enabled, the router automatically replies to OPTIONS requests.
 		// Custom OPTIONS handlers take priority over automatic replies.
 		HandleOPTIONS bool
-
-		// Configurable http.Handler which is called when a request
-		// cannot be routed and HandleMethodNotAllowed is true.
-		// If it is not set, http.Error with http.StatusMethodNotAllowed is used.
-		// The "Allow" header with allowed request methods is set before the handler
-		// is called.
-		MethodNotAllowed http.Handler
 	}
 
 	// Handle is a function that can be registered to a route to handle HTTP
@@ -169,13 +156,13 @@ func (ps Params) ByName(name string) string {
 // Path auto-correction, including trailing slashes, is enabled by default.
 func NewRouter(server *HttpServer) *router {
 	return &router{
-		RedirectTrailingSlash:  true,
-		RedirectFixedPath:      true,
-		HandleMethodNotAllowed: true,
-		HandleOPTIONS:          true,
-		server:                 server,
-		handlerMap:             make(map[string]HttpHandle),
-		handlerMutex:           new(sync.RWMutex),
+		RedirectTrailingSlash: true,
+		RedirectFixedPath:     true,
+		HandleOPTIONS:         true,
+		allRouterExpress:      make(map[string]struct{}),
+		server:                server,
+		handlerMap:            make(map[string]HttpHandle),
+		handlerMutex:          new(sync.RWMutex),
 	}
 }
 
@@ -198,6 +185,14 @@ func (r *router) MatchPath(ctx Context, routePath string) bool {
 		return n == ctx.RouterNode().Node()
 	}
 	return false
+}
+
+func (r *router) getNode(httpMethod string, routePath string) *Node{
+	if root := r.Nodes[httpMethod]; root != nil {
+		n := root.getNode(routePath)
+		return n
+	}
+	return nil
 }
 
 // ServeHTTP makes the router implement the http.Handler interface.
@@ -255,28 +250,17 @@ func (r *router) ServeHTTP(ctx *HttpContext) {
 		}
 	} else {
 		// Handle 405
-		if r.HandleMethodNotAllowed {
-			if allow := r.allowed(path, req.Method); len(allow) > 0 {
-				w.Header().Set("Allow", allow)
-				if r.MethodNotAllowed != nil {
-					r.MethodNotAllowed.ServeHTTP(w, req)
-				} else {
-					http.Error(w,
-						http.StatusText(http.StatusMethodNotAllowed),
-						http.StatusMethodNotAllowed,
-					)
-				}
-				return
-			}
+		if allow := r.allowed(path, req.Method); len(allow) > 0 {
+			w.Header().Set("Allow", allow)
+			ctx.Response().SetStatusCode(http.StatusMethodNotAllowed)
+			r.server.DotApp.MethodNotAllowedHandler(ctx)
+			return
 		}
 	}
 
 	// Handle 404
-	if r.server.DotApp.NotFoundHandler != nil {
-		r.server.DotApp.NotFoundHandler(w, req)
-	} else {
-		http.NotFound(w, req)
-	}
+	ctx.Response().SetStatusCode(http.StatusNotFound)
+	r.server.DotApp.NotFoundHandler(ctx)
 }
 
 //wrap HttpHandle to Handle
@@ -319,11 +303,11 @@ func (r *router) wrapRouterHandle(handler HttpHandle, isHijack bool) RouterHandl
 						HttpBody:   errmsg,
 					}
 					logString := jsonutil.GetJsonString(logJson)
-					logger.Logger().Log(logString, LogTarget_HttpServer, LogLevel_Error)
+					logger.Logger().Error(logString, LogTarget_HttpServer)
 				}
 
 				//增加错误计数
-				core.GlobalState.AddErrorCount(1)
+				core.GlobalState.AddErrorCount(httpCtx.Request().Path(), fmt.Errorf("%v", err), 1)
 			}
 
 			FeatureTools.ReleaseFeatures(r.server, httpCtx)
@@ -334,49 +318,41 @@ func (r *router) wrapRouterHandle(handler HttpHandle, isHijack bool) RouterHandl
 			}
 		}()
 
-		//处理前置Module集合
-		for _, module := range r.server.DotApp.Modules {
-			if module.OnBeginRequest != nil {
-				module.OnBeginRequest(httpCtx)
-			}
-		}
-
 		//处理用户handle
 		var ctxErr error
-		if len(r.server.DotApp.Middlewares) > 0 {
-			ctxErr = r.server.DotApp.Middlewares[0].Handle(httpCtx)
+		//if len(r.server.DotApp.Middlewares) > 0 {
+		//	ctxErr = r.server.DotApp.Middlewares[0].Handle(httpCtx)
+		//} else {
+		//	ctxErr = handler(httpCtx)
+		//}
+
+		if len(httpCtx.routerNode.AppMiddlewares()) > 0 {
+			ctxErr = httpCtx.routerNode.AppMiddlewares()[0].Handle(httpCtx)
 		} else {
 			ctxErr = handler(httpCtx)
 		}
+
 		if ctxErr != nil {
 			//handler the exception
 			if r.server.DotApp.ExceptionHandler != nil {
 				r.server.DotApp.ExceptionHandler(httpCtx, ctxErr)
 				//增加错误计数
-				core.GlobalState.AddErrorCount(1)
+				core.GlobalState.AddErrorCount(httpCtx.Request().Path(), ctxErr, 1)
 			}
 		}
 
-		//处理后置Module集合
-		for _, module := range r.server.DotApp.Modules {
-			if module.OnEndRequest != nil {
-				module.OnEndRequest(httpCtx)
-			}
-		}
 	}
 }
 
 //wrap fileHandler to httprouter.Handle
 func (r *router) wrapFileHandle(fileHandler http.Handler) RouterHandle {
 	return func(httpCtx *HttpContext) {
-		//增加状态计数
-		core.GlobalState.AddRequestCount(1)
 		startTime := time.Now()
 		httpCtx.Request().URL.Path = httpCtx.RouterParams().ByName("filepath")
 		fileHandler.ServeHTTP(httpCtx.Response().Writer(), httpCtx.Request().Request)
 		timetaken := int64(time.Now().Sub(startTime) / time.Millisecond)
 		//HttpServer Logging
-		logger.Logger().Log(httpCtx.Request().Url()+" "+logRequest(httpCtx.Request().Request, timetaken), LogTarget_HttpRequest, LogLevel_Debug)
+		logger.Logger().Debug(httpCtx.Request().Url()+" "+logRequest(httpCtx.Request().Request, timetaken), LogTarget_HttpRequest)
 	}
 }
 
@@ -442,10 +418,10 @@ func (r *router) RegisterRoute(routeMethod string, path string, handle HttpHandl
 	handleName := handlerName(handle)
 	routeMethod = strings.ToUpper(routeMethod)
 	if _, exists := HttpMethodMap[routeMethod]; !exists {
-		logger.Logger().Log("Dotweb:Router:RegisterRoute failed [illegal method] ["+routeMethod+"] ["+path+"] ["+handleName+"]", LogTarget_HttpServer, LogLevel_Warn)
+		logger.Logger().Warn("DotWeb:Router:RegisterRoute failed [illegal method] ["+routeMethod+"] ["+path+"] ["+handleName+"]", LogTarget_HttpServer)
 		return nil
 	} else {
-		logger.Logger().Log("Dotweb:Router:RegisterRoute success ["+routeMethod+"] ["+path+"] ["+handleName+"]", LogTarget_HttpServer, LogLevel_Debug)
+		logger.Logger().Debug("DotWeb:Router:RegisterRoute success ["+routeMethod+"] ["+path+"] ["+handleName+"]", LogTarget_HttpServer)
 	}
 
 	//websocket mode,use default httpserver
@@ -464,7 +440,7 @@ func (r *router) RegisterRoute(routeMethod string, path string, handle HttpHandl
 
 	//if set auto-head, add head router
 	//only enabled in hijack\GET\POST\DELETE\PUT\HEAD\PATCH\OPTIONS
-	if r.server.ServerConfig.EnabledAutoHEAD {
+	if r.server.ServerConfig().EnabledAutoHEAD {
 		if routeMethod == RouteMethod_HiJack {
 			r.add(RouteMethod_HEAD, path, r.wrapRouterHandle(handle, true))
 		} else if routeMethod != RouteMethod_Any {
@@ -483,7 +459,7 @@ func (r *router) ServerFile(path string, fileroot string) RouterNode {
 	}
 	var root http.FileSystem
 	root = http.Dir(fileroot)
-	if !r.server.ServerConfig.EnabledListDir {
+	if !r.server.ServerConfig().EnabledListDir {
 		root = &core.HideReaddirFS{root}
 	}
 	fileServer := http.FileServer(root)
@@ -523,6 +499,8 @@ func (r *router) add(method, path string, handle RouterHandle, m ...Middleware) 
 	}
 	//fmt.Println("Handle => ", method, " - ", *root, " - ", path)
 	outnode = root.addRoute(path, handle, m...)
+	outnode.fullPath = path
+	r.allRouterExpress[method+"_"+path] = struct{}{}
 	return
 }
 
@@ -569,9 +547,9 @@ func (r *router) wrapWebSocketHandle(handler HttpHandle) websocket.Handler {
 	return func(ws *websocket.Conn) {
 		//get from pool
 		req := r.server.pool.request.Get().(*Request)
-		req.reset(ws.Request())
 		httpCtx := r.server.pool.context.Get().(*HttpContext)
 		httpCtx.reset(nil, req, r.server, nil, nil, handler)
+		req.reset(ws.Request(), httpCtx)
 		httpCtx.webSocket = &WebSocket{
 			Conn: ws,
 		}
@@ -591,14 +569,14 @@ func (r *router) wrapWebSocketHandle(handler HttpHandle) websocket.Handler {
 					HttpBody:   errmsg,
 				}
 				logString := jsonutil.GetJsonString(logJson)
-				logger.Logger().Log(logString, LogTarget_HttpServer, LogLevel_Error)
+				logger.Logger().Error(logString, LogTarget_HttpServer)
 
 				//增加错误计数
-				core.GlobalState.AddErrorCount(1)
+				core.GlobalState.AddErrorCount(httpCtx.Request().Path(), fmt.Errorf("%v", err), 1)
 			}
 			timetaken := int64(time.Now().Sub(startTime) / time.Millisecond)
 			//HttpServer Logging
-			logger.Logger().Log(httpCtx.Request().Url()+" "+logWebsocketContext(httpCtx, timetaken), LogTarget_HttpRequest, LogLevel_Debug)
+			logger.Logger().Debug(httpCtx.Request().Url()+" "+logWebsocketContext(httpCtx, timetaken), LogTarget_HttpRequest)
 
 			//release request
 			req.release()
@@ -609,9 +587,6 @@ func (r *router) wrapWebSocketHandle(handler HttpHandle) websocket.Handler {
 		}()
 
 		handler(httpCtx)
-
-		//增加状态计数
-		core.GlobalState.AddRequestCount(1)
 	}
 }
 

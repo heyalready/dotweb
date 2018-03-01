@@ -1,7 +1,7 @@
 package dotweb
 
 import (
-	"github.com/devfeel/dotweb/framework/crypto"
+	"github.com/devfeel/dotweb/framework/crypto/uuid"
 	"io/ioutil"
 	"net/http"
 	"net/url"
@@ -10,16 +10,21 @@ import (
 
 type Request struct {
 	*http.Request
+	httpCtx    *HttpContext
 	postBody   []byte
 	isReadBody bool
 	requestID  string
 }
 
 //reset response attr
-func (req *Request) reset(r *http.Request) {
+func (req *Request) reset(r *http.Request, ctx *HttpContext) {
 	req.Request = r
 	req.isReadBody = false
-	req.requestID = cryptos.GetUUID()
+	if ctx.HttpServer().ServerConfig().EnabledRequestID {
+		req.requestID = uuid.NewV4().String32()
+	} else {
+		req.requestID = ""
+	}
 }
 
 func (req *Request) release() {
@@ -30,29 +35,28 @@ func (req *Request) release() {
 }
 
 // RequestID get unique ID with current request
+// must HttpServer.SetEnabledRequestID(true)
+// default is empty string
 func (req *Request) RequestID() string {
 	return req.requestID
 }
 
-// QueryStrings 返回查询字符串map表示
+// QueryStrings 返回Get请求方式下查询字符串map表示
 func (req *Request) QueryStrings() url.Values {
 	return req.URL.Query()
 }
 
-/*
-* 获取原始查询字符串
- */
+// RawQuery 获取原始查询字符串
 func (req *Request) RawQuery() string {
 	return req.URL.RawQuery
 }
 
-/*
-* 根据指定key获取对应value
- */
+// QueryString 根据指定key获取在Get请求中对应参数值
 func (req *Request) QueryString(key string) string {
 	return req.URL.Query().Get(key)
 }
 
+// FormFile get file by form key
 func (req *Request) FormFile(key string) (*UploadFile, error) {
 	file, header, err := req.Request.FormFile(key)
 	if err != nil {
@@ -62,12 +66,35 @@ func (req *Request) FormFile(key string) (*UploadFile, error) {
 	}
 }
 
-/*
-* 获取包括post、put和get内的值
- */
+// FormFiles get multi files
+// fixed #92
+func (req *Request) FormFiles()(map[string]*UploadFile, error){
+	files := make(map[string]*UploadFile)
+	req.parseForm()
+	if req.Request.MultipartForm == nil || req.Request.MultipartForm.File == nil {
+		return nil, http.ErrMissingFile
+	}
+	for key, fileMap:=range req.Request.MultipartForm.File{
+		if len(fileMap) > 0{
+			file, err := fileMap[0].Open()
+			if err== nil{
+				files[key] = NewUploadFile(file, fileMap[0])
+			}
+		}
+	}
+	return files, nil
+}
+
+// FormValues including both the URL field's query parameters and the POST or PUT form data
 func (req *Request) FormValues() map[string][]string {
 	req.parseForm()
 	return map[string][]string(req.Form)
+}
+
+// PostValues contains the parsed form data from POST, PATCH, or PUT body parameters
+func (req *Request) PostValues() map[string][]string {
+	req.parseForm()
+	return map[string][]string(req.PostForm)
 }
 
 func (req *Request) parseForm() error {
@@ -83,10 +110,12 @@ func (req *Request) parseForm() error {
 	return nil
 }
 
+// ContentType get ContentType
 func (req *Request) ContentType() string {
 	return req.Header.Get(HeaderContentType)
 }
 
+// QueryHeader query header value by key
 func (req *Request) QueryHeader(key string) string {
 	return req.Header.Get(key)
 }
@@ -144,6 +173,7 @@ func (req *Request) IsAJAX() bool {
 	return req.Header.Get(HeaderXRequestedWith) == "XMLHttpRequest"
 }
 
+// Url get request url
 func (req *Request) Url() string {
 	return req.URL.String()
 }

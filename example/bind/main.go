@@ -17,6 +17,8 @@ func main() {
 	//这里仅为示例，默认情况下，开启的模式就是development模式
 	app.SetDevelopmentMode()
 
+	//使用json标签
+	app.HttpServer.SetEnabledBindUseJsonTag(true)
 	//设置gzip开关
 	//app.HttpServer.SetEnabledGzip(true)
 
@@ -46,14 +48,17 @@ func TestBind(ctx dotweb.Context) error {
 
 	}
 
-	_, err := ctx.WriteString("TestBind [" + errstr + "] " + fmt.Sprint(user))
-	return err
+	return ctx.WriteString("TestBind [" + errstr + "] " + fmt.Sprint(user))
 }
 
 func GetBind(ctx dotweb.Context) error {
+	//type UserInfo struct {
+	//	UserName string `form:"user"`
+	//	Sex      int    `form:"sex"`
+	//}
 	type UserInfo struct {
-		UserName string `form:"user"`
-		Sex      int    `form:"sex"`
+		UserName string `json:"user"`
+		Sex      int    `json:"sex"`
 	}
 	user := new(UserInfo)
 	errstr := "no error"
@@ -63,11 +68,27 @@ func GetBind(ctx dotweb.Context) error {
 
 	}
 
-	_, err := ctx.WriteString("GetBind [" + errstr + "] " + fmt.Sprint(user))
-	return err
+	return ctx.WriteString("GetBind [" + errstr + "] " + fmt.Sprint(user))
+}
+
+func PostJsonBind(ctx dotweb.Context) error{
+	type UserInfo struct {
+		UserName string `json:"user"`
+		Sex      int    `json:"sex"`
+	}
+	user := new(UserInfo)
+	errstr := "no error"
+	if err := ctx.BindJsonBody(user); err != nil {
+		errstr = err.Error()
+	} else {
+
+	}
+
+	return ctx.WriteString("PostBind [" + errstr + "] " + fmt.Sprint(user))
 }
 
 func InitRoute(server *dotweb.HttpServer) {
 	server.Router().POST("/", TestBind)
 	server.Router().GET("/getbind", GetBind)
+	server.Router().POST("/jsonbind", PostJsonBind)
 }
